@@ -9,6 +9,9 @@ import uuid
 from datetime import datetime
 import logging
 import socketio
+import base64
+import hashlib
+from cryptography.fernet import Fernet
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +47,8 @@ class Message(BaseModel):
     content: str
     encrypted: bool = False
     timestamp: datetime
+    message_id: str = None
+    key_used: Optional[List[int]] = None
 
 # Global state management
 class BB84Session:
@@ -247,6 +252,65 @@ class BB84Protocol:
             return sifted_key[::2]  # Take every other bit
         else:  # High error rate - significant reduction
             return sifted_key[::3]  # Take every third bit
+    
+    @staticmethod
+    def encrypt_message_otp(message: str, key: List[int]) -> str:
+        """Encrypt message using One-Time Pad with BB84 key"""
+        if not key or len(key) == 0:
+            return message
+        
+        # Convert message to bytes
+        message_bytes = message.encode('utf-8')
+        encrypted_bytes = bytearray()
+        key_index = 0
+        
+        for byte in message_bytes:
+            # XOR each byte with key bits (cycling through key)
+            key_byte = 0
+            for bit_pos in range(8):
+                if key_index < len(key):
+                    key_byte |= (key[key_index] << bit_pos)
+                    key_index += 1
+                else:
+                    key_index = 0
+                    key_byte |= (key[key_index] << bit_pos)
+                    key_index += 1
+            
+            encrypted_bytes.append(byte ^ key_byte)
+        
+        # Return base64 encoded result
+        return base64.b64encode(encrypted_bytes).decode('utf-8')
+    
+    @staticmethod
+    def decrypt_message_otp(encrypted_message: str, key: List[int]) -> str:
+        """Decrypt message using One-Time Pad with BB84 key"""
+        if not key or len(key) == 0:
+            return encrypted_message
+        
+        try:
+            # Decode base64
+            encrypted_bytes = base64.b64decode(encrypted_message.encode('utf-8'))
+            decrypted_bytes = bytearray()
+            key_index = 0
+            
+            for byte in encrypted_bytes:
+                # XOR each byte with key bits (cycling through key)
+                key_byte = 0
+                for bit_pos in range(8):
+                    if key_index < len(key):
+                        key_byte |= (key[key_index] << bit_pos)
+                        key_index += 1
+                    else:
+                        key_index = 0
+                        key_byte |= (key[key_index] << bit_pos)
+                        key_index += 1
+                
+                decrypted_bytes.append(byte ^ key_byte)
+            
+            return decrypted_bytes.decode('utf-8')
+        except Exception as e:
+            logger.error(f"Decryption error: {e}")
+            return encrypted_message
 
 # API Endpoints
 @app.get("/")
@@ -411,17 +475,47 @@ async def handle_basis_comparison(data):
 
 async def handle_send_message(data):
     """Handle sending encrypted message"""
+    message_id = str(uuid.uuid4())
+    sender = data["sender"]
+    content = data["content"]
+    encrypted = data.get("encrypted", False)
+    
+    # Get the appropriate key based on sender
+    if sender == "alice":
+        key_used = session.alice_data.final_key
+    elif sender == "bob":
+        key_used = session.bob_data.final_key
+    else:
+        key_used = []
+    
+    # Encrypt message if requested and key is available
+    if encrypted and key_used and len(key_used) > 0:
+        encrypted_content = BB84Protocol.encrypt_message_otp(content, key_used)
+        logger.info(f"Message encrypted using {len(key_used)}-bit key")
+    else:
+        encrypted_content = content
+    
     message = Message(
-        sender=data["sender"],
-        content=data["content"],
-        encrypted=data.get("encrypted", False),
-        timestamp=datetime.now()
+        sender=sender,
+        content=encrypted_content,
+        encrypted=encrypted,
+        timestamp=datetime.now(),
+        message_id=message_id,
+        key_used=key_used
     )
     session.messages.append(message)
     
+    # Broadcast to all connected users
     await manager.broadcast(json.dumps({
         "type": "new_message",
-        "data": message.dict()
+        "data": {
+            "sender": message.sender,
+            "content": message.content,
+            "encrypted": message.encrypted,
+            "timestamp": message.timestamp.isoformat(),
+            "message_id": message.message_id,
+            "key_used": message.key_used
+        }
     }))
 
 if __name__ == "__main__":
